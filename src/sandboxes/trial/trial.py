@@ -28,6 +28,7 @@ from sandboxes.models.trial.result import (
 )
 from sandboxes.tasks.client import TasksClient
 from sandboxes.verifier.verifier import Verifier
+from sandboxes.cloud.defaults import CloudDefaults
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +109,10 @@ class Trial:
             session_id=self.config.trial_name,
             trial_paths=self._trial_paths,
             task_env_config=self._task.config.environment,
+            # Provide task metadata for S3 staging and keying
+            task_name=self._task.name,
+            task_version=self._task.checksum[:12],
+            job_id=str(self.job_id) if self.job_id is not None else None,
             **config.environment.kwargs,
         )
 
@@ -305,6 +310,13 @@ class Trial:
             config=self.config,
             task_checksum=self._task.checksum,
             trial_uri=self._trial_paths.trial_dir.expanduser().resolve().as_uri(),
+            # Populate S3 URIs for remote mirroring (bucket defaults from CloudDefaults)
+            s3_task_uri=f"s3://{CloudDefaults().s3_bucket}/tasks/{self._task.name}/{self._task.checksum[:12]}/",
+            s3_trial_uri=(
+                f"s3://{CloudDefaults().s3_bucket}/trials/{self.job_id}/{self.config.trial_name}/"
+                if self.job_id is not None
+                else f"s3://{CloudDefaults().s3_bucket}/trials/single/{self.config.trial_name}/"
+            ),
             agent_info=self._agent.to_agent_info(),
         )
 

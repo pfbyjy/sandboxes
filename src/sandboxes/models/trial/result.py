@@ -55,6 +55,9 @@ class TrialResult(BaseModel):
     task_name: str
     trial_name: str
     trial_uri: str
+    # Optional S3 mirror locations (populated for remote runs)
+    s3_task_uri: str | None = None
+    s3_trial_uri: str | None = None
     task_id: LocalTaskId | GitTaskId
     task_checksum: str
     config: TrialConfig
