@@ -168,6 +168,118 @@ Troubleshooting (Autoscaling)
 - "unknown capacity type capacity-block" log lines
   - Note: benign on v0.16.x for certain GPU/Trainium families; can be ignored.
 
+## Batch-Scale Hardening (100+)
+
+When bursting to dozens of concurrent trials, focus on avoiding ephemeral-storage pressure and minimizing external rate limits.
+
+- Increase node root volume
+  - v0.16.x: set `blockDeviceMappings` on `AWSNodeTemplate` to grow the root EBS volume (e.g., gp3 100Gi).
+  - Example (partial):
+    ```yaml
+    apiVersion: karpenter.k8s.aws/v1alpha1
+    kind: AWSNodeTemplate
+    metadata:
+      name: abundant-sb
+    spec:
+      blockDeviceMappings:
+        - deviceName: /dev/xvda
+          ebs:
+            volumeSize: 100Gi
+            volumeType: gp3
+            iops: 3000
+            throughput: 125
+            deleteOnTermination: true
+    ```
+  - Drain + delete DiskPressure nodes to rotate onto larger disks.
+
+- Make storage schedulable
+  - Add `resources.requests.ephemeral-storage` (e.g., 8–16Gi) and a corresponding `limits.ephemeral-storage` on trial pods so the scheduler/Karpenter adds nodes before disks fill.
+
+- Recycle burst nodes
+  - Use `ttlSecondsAfterEmpty` (predictable) or `consolidation.enabled` (cost-aware) to reset disk state between bursts.
+
+- Build stability (avoid Docker Hub 429)
+  - Prefer ECR Public bases: pre-pull/retag in CodeBuild `pre_build` (e.g., `public.ecr.aws/docker/library/python:3.13-slim -> python:3.13-slim`).
+  - Optional: pass `DOCKERHUB_USERNAME`/`DOCKERHUB_TOKEN` to CodeBuild and `docker login` when present.
+  - Add a small retry/backoff around CodeBuild builds on `FAILED/TIMED_OUT`.
+
+- Remote I/O robustness
+  - Ensure S3/ECR/CodeBuild once via `sb cloud init`; do not "ensure" per trial.
+  - Add retries/backoff on S3 `cp`/`presign` and fall back to `kubectl cp` for inputs if S3 fails.
+  - On teardown, upload `/logs` to S3 best‑effort; if missing and the pod will be deleted, optionally capture `kubectl logs` before deletion.
+
+- Operational fast-path
+  - If nodes show `DiskPressure`/`Evicted` events: `kubectl drain <node> --ignore-daemonsets --delete-emptydir-data && kubectl delete node <node>` to force replacement.
+  - Delete `ContainerStatusUnknown` sb-* pods to reschedule impacted trials.
+
+## Manual Updates (Stopgap)
+
+Until IaC is in place, apply the following manual tweaks to stabilize large bursts:
+
+- Increase Karpenter node root volume (v0.16.x)
+  - Update the `AWSNodeTemplate` (name `abundant-sb`) to 100Gi gp3 root volume:
+    ```bash
+    kubectl apply -f - <<'YAML'
+    apiVersion: karpenter.k8s.aws/v1alpha1
+    kind: AWSNodeTemplate
+    metadata:
+      name: abundant-sb
+    spec:
+      blockDeviceMappings:
+        - deviceName: /dev/xvda
+          ebs:
+            volumeSize: 100Gi
+            volumeType: gp3
+            iops: 3000
+            throughput: 125
+            deleteOnTermination: true
+    YAML
+    ```
+
+- Recycle DiskPressure nodes and reschedule unknown pods
+  ```bash
+  # Identify nodes with recent DiskPressure events (optional)
+  kubectl get nodes -o name | xargs -n1 -I{} sh -c 'echo {}; kubectl describe {} | rg -n "NodeHasDiskPressure|EvictionThresholdMet" || true'
+
+  # Drain and delete a hot node (replace with your node name)
+  kubectl drain ip-192-168-123-245.us-west-2.compute.internal \
+    --ignore-daemonsets --delete-emptydir-data
+  kubectl delete node ip-192-168-123-245.us-west-2.compute.internal
+
+  # Delete sb-* pods stuck in ContainerStatusUnknown
+  kubectl get pods | awk '/ContainerStatusUnknown/ {print $1}' | xargs -r kubectl delete pod
+  ```
+
+- Add ephemeral-storage defaults via LimitRange (namespace `default`)
+  ```bash
+  kubectl apply -f - <<'YAML'
+  apiVersion: v1
+  kind: LimitRange
+  metadata:
+    name: default-ephemeral-storage
+    namespace: default
+  spec:
+    limits:
+      - type: Container
+        defaultRequest:
+          ephemeral-storage: "8Gi"
+        default:
+          ephemeral-storage: "16Gi"
+  YAML
+  ```
+
+- Provisioner TTL (v0.16.x) to recycle burst nodes when idle
+  ```bash
+  # Remove consolidation if present (mutually exclusive)
+  kubectl patch provisioner default --type=json \
+    -p='[{"op":"remove","path":"/spec/consolidation"}]' || true
+  # Set a short TTL after empty
+  kubectl patch provisioner default --type=merge -p '{"spec":{"ttlSecondsAfterEmpty":120}}'
+  ```
+
+- CodeBuild base image hardening (optional; avoids Docker Hub 429)
+  - Export `DOCKERHUB_USERNAME`/`DOCKERHUB_TOKEN` in your environment and we will add `docker login` in pre_build on the next code update; for now, simply re-run failed builds or prefer tasks with ECR Public bases.
+
 Logs and links (remote UX):
 - Short term: we still download verifier reward and can optionally upload the whole `trial_dir` to S3 at the end.
 - Mid term (preferred): stream pod logs to CloudWatch and provide deep links instead of local logs.

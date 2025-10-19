@@ -226,36 +226,20 @@ class KubernetesEnvironment(BaseEnvironment):
     async def upload_dir(self, source_dir: Path | str, target_dir: str):
         # Prefer S3-staged fetch for remote clusters for /solution and /tests
         if self._use_s3_staging() and target_dir.rstrip("/") in {"/solution", "/tests"}:
-            await self._upload_dir_via_s3(Path(source_dir), target_dir)
-            return
-
-        # Fallback to kubectl cp
-        await self.exec(f"mkdir -p {shlex.quote(target_dir)}")
-        src = Path(source_dir)
-        if src.is_dir():
-            entries = list(src.iterdir())
-            if not entries:
+            try:
+                await self._upload_dir_via_s3(Path(source_dir), target_dir)
                 return
-            for entry in entries:
-                await self._kubectl_with_retries(
-                    [
-                        "cp",
-                        str(entry),
-                        f"{self._pod_name}:{target_dir}/",
-                        "-c",
-                        "main",
-                    ]
-                )
-        else:
-            await self._kubectl_with_retries(
-                [
-                    "cp",
-                    str(src),
-                    f"{self._pod_name}:{target_dir}",
-                    "-c",
-                    "main",
-                ]
-            )
+            except Exception:
+                # Soft-fallback to kubectl cp when S3 is unavailable or the image lacks fetch tools
+                try:
+                    await self._upload_dir_via_kubectl_cp(Path(source_dir), target_dir)
+                    return
+                except Exception:
+                    # re-raise the original S3 exception to keep context for callers
+                    raise
+
+        # Default path: kubectl cp
+        await self._upload_dir_via_kubectl_cp(Path(source_dir), target_dir)
 
     async def download_file(self, source_path: str, target_path: Path | str):
         Path(target_path).parent.mkdir(parents=True, exist_ok=True)
@@ -304,7 +288,6 @@ class KubernetesEnvironment(BaseEnvironment):
         if target not in {"solution", "tests"}:
             raise ValueError(f"S3 staging only supports /solution or /tests, got {target_dir}")
 
-        await self._ensure_s3_bucket(self._s3_bucket)
         # Create tar.gz with top-level folder name (solution/ or tests/)
         with tempfile.TemporaryDirectory() as td:
             tar_path = Path(td) / f"{target}.tar.gz"
@@ -312,13 +295,16 @@ class KubernetesEnvironment(BaseEnvironment):
                 tf.add(str(source_dir), arcname=target)
 
             key = f"{self._task_s3_prefix()}/{target}.tar.gz"
-            await self._aws(["s3", "cp", str(tar_path), f"s3://{self._s3_bucket}/{key}"])
+            # Best-effort: if upload fails (e.g., S3 endpoint not reachable), allow caller to fallback
+            up = await self._aws(["s3", "cp", str(tar_path), f"s3://{self._s3_bucket}/{key}"], check=False)
+            if up.return_code != 0:
+                raise RuntimeError(up.stderr or up.stdout or "failed to upload inputs to S3")
 
         # Generate pre-signed GET URL and fetch/extract inside the pod
-        presign = await self._aws(["s3", "presign", f"s3://{self._s3_bucket}/{key}"])
+        presign = await self._aws(["s3", "presign", f"s3://{self._s3_bucket}/{key}"], check=False)
         url = (presign.stdout or "").strip()
-        if not url:
-            raise RuntimeError("Failed to generate pre-signed URL for S3 input")
+        if presign.return_code != 0 or not url:
+            raise RuntimeError("failed to generate pre-signed URL for S3 input")
 
         fetch_cmd = (
             "set -eo pipefail; "
@@ -330,6 +316,35 @@ class KubernetesEnvironment(BaseEnvironment):
         res = await self.exec(fetch_cmd)
         if res.return_code != 0:
             raise RuntimeError(f"Failed to fetch and extract {target} via S3: {res.stderr or res.stdout}")
+
+    async def _upload_dir_via_kubectl_cp(self, source_dir: Path, target_dir: str) -> None:
+        # Ensure target dir exists inside the container
+        await self.exec(f"mkdir -p {shlex.quote(target_dir)}")
+        src = source_dir
+        if src.is_dir():
+            entries = list(src.iterdir())
+            if not entries:
+                return
+            for entry in entries:
+                await self._kubectl_with_retries(
+                    [
+                        "cp",
+                        str(entry),
+                        f"{self._pod_name}:{target_dir}/",
+                        "-c",
+                        "main",
+                    ]
+                )
+        else:
+            await self._kubectl_with_retries(
+                [
+                    "cp",
+                    str(src),
+                    f"{self._pod_name}:{target_dir}",
+                    "-c",
+                    "main",
+                ]
+            )
 
     async def exec(
         self,

@@ -64,6 +64,8 @@ class Codex(BaseInstalledAgent):
             "OPENAI_API_KEY": os.environ.get("OPENAI_API_KEY", ""),
         }
 
+        log_path = str(EnvironmentPaths.agent_dir / self._OUTPUT_FILENAME)
+
         return [
             ExecInput(
                 command="""
@@ -78,6 +80,11 @@ EOF
             ),
             ExecInput(
                 command=(
+                    # Ensure nvm is loaded and Node version used so codex is on PATH
+                    "export NVM_DIR=\"$HOME/.nvm\"; "
+                    "[ -s \"$NVM_DIR/nvm.sh\" ] && . \"$NVM_DIR/nvm.sh\"; "
+                    "nvm use 22 >/dev/null 2>&1 || true; "
+                    # Run codex
                     "codex exec "
                     "--dangerously-bypass-approvals-and-sandbox "
                     "--skip-git-repo-check "
@@ -85,9 +92,7 @@ EOF
                     "--json "
                     "-- "  # end of flags
                     f"{escaped_instruction} "
-                    f"2>&1 </dev/null | tee {
-                        EnvironmentPaths.agent_dir / self._OUTPUT_FILENAME
-                    }"
+                    f"2>&1 </dev/null | tee {log_path}"
                 ),
                 env=env,
             ),

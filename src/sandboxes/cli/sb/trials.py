@@ -288,10 +288,18 @@ def start(
     console.print(f"Finished: {result.finished_at}")
 
     if result.exception_info:
-        console.print(
-            f"[bold red]Error: {result.exception_info.exception_type}[/bold red]"
-        )
-        console.print(f"Message: {result.exception_info.exception_message}")
+        # Treat agent timeouts as expected: continue to verifier and show reward if present
+        if result.exception_info.exception_type == "AgentTimeoutError":
+            console.print("[yellow]Agent timed out; continuing with verifier[/yellow]")
+            if result.verifier_result:
+                console.print(f"Reward: {result.verifier_result.reward}")
+            else:
+                console.print("Trial completed with no verifier result")
+        else:
+            console.print(
+                f"[bold red]Error: {result.exception_info.exception_type}[/bold red]"
+            )
+            console.print(f"Message: {result.exception_info.exception_message}")
     elif result.verifier_result:
         console.print(f"Reward: {result.verifier_result.reward}")
     else:

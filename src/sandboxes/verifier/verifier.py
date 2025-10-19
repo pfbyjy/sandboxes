@@ -79,42 +79,39 @@ class Verifier:
                 ]
             )
         )
-
+        # Persist console output locally in case tee didn't write due to piping issues
         if result.stdout and (
             not self.trial_paths.test_console_output_path.exists()
             or self.trial_paths.test_console_output_path.stat().st_size == 0
         ):
             self.trial_paths.test_console_output_path.write_text(result.stdout)
 
-        if result.return_code != 0:
-            raise TestCommandError(
-                f"Test command failed with return code {result.return_code}"
-            )
-
-        await self.environment.download_file(
-            source_path="/logs/verifier/reward.txt",
-            target_path=self.trial_paths.reward_path,
-        )
-
-        if not self.trial_paths.reward_path.exists():
-            raise RewardFileNotFoundError(
-                f"Reward file not found at {self.trial_paths.reward_path}"
-            )
-
-        reward = self.trial_paths.reward_path.read_text()
-
-        if not reward:
-            raise RewardFileEmptyError(
-                f"Reward file is empty at {self.trial_paths.reward_path}"
-            )
-
+        # Always attempt to fetch reward, even if the test command failed
+        reward_value: float | None = None
         try:
-            reward_value = float(reward)
-        except (ValueError, TypeError) as e:
-            raise VerifierOutputParseError(
-                f"Failed to parse reward value from '{reward}' in file {
-                    self.trial_paths.reward_path
-                }: {e}"
-            ) from e
+            await self.environment.download_file(
+                source_path="/logs/verifier/reward.txt",
+                target_path=self.trial_paths.reward_path,
+            )
+            if self.trial_paths.reward_path.exists():
+                reward_text = self.trial_paths.reward_path.read_text().strip()
+                if reward_text:
+                    try:
+                        reward_value = float(reward_text)
+                    except (ValueError, TypeError):
+                        reward_value = None
+        except Exception:
+            # Ignore download failures; we'll fallback to 0 below
+            reward_value = None
+
+        # If tests failed or reward is missing/unparseable, default to 0.0
+        if result.return_code != 0 or reward_value is None:
+            reward_value = 0.0
+            # Ensure a local reward file exists to keep UX consistent
+            try:
+                self.trial_paths.reward_path.parent.mkdir(parents=True, exist_ok=True)
+                self.trial_paths.reward_path.write_text("0")
+            except Exception:
+                pass
 
         return VerifierResult(reward=reward_value)
